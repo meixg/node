@@ -850,7 +850,7 @@ void FromNamespacedPath(std::string* path) {
 #endif
 }
 
-void AfterMkdirp(uv_fs_t* req) {
+void AfterMkdir(uv_fs_t* req) {
   FSReqBase* req_wrap = FSReqBase::from_req(req);
   FSReqAfterScope after(req_wrap, req);
   FS_ASYNC_TRACE_END1(
@@ -1737,6 +1737,37 @@ int MKDirpAsync(uv_loop_t* loop,
   return err;
 }
 
+int MKDirAsync(uv_loop_t* loop,
+                uv_fs_t* req,
+                const char* path,
+                int mode,
+                uv_fs_cb cb) {
+  FSReqBase* req_wrap = FSReqBase::from_req(req);
+  // on the first iteration of algorithm, stash state information.
+  if (req_wrap->continuation_data() == nullptr) {
+    req_wrap->set_continuation_data(
+        std::make_unique<FSContinuationData>(req, mode, cb));
+    req_wrap->continuation_data()->PushPath(std::move(path));
+  }
+
+  // on each iteration of algorithm, mkdir directory on top of stack.
+  std::string next_path = req_wrap->continuation_data()->PopPath();
+  int err = uv_fs_mkdir(loop, req, next_path.c_str(), mode,
+                        uv_fs_callback_t{[](uv_fs_t* req) {
+    FSReqBase* req_wrap = FSReqBase::from_req(req);
+    Environment* env = req_wrap->env();
+    uv_loop_t* loop = env->event_loop();
+    std::string path = req->path;
+    int err = static_cast<int>(req->result);
+    if (err == 0) {
+      req_wrap->continuation_data()->MaybeSetFirstPath(path);
+    }
+    req_wrap->continuation_data()->Done(err);
+  }});
+
+  return err;
+}
+
 int CallMKDirpSync(Environment* env, const FunctionCallbackInfo<Value>& args,
                    FSReqWrapSync* req_wrap, const char* path, int mode) {
   env->PrintSyncTrace();
@@ -1778,8 +1809,8 @@ static void MKDir(const FunctionCallbackInfo<Value>& args) {
     FS_ASYNC_TRACE_BEGIN1(
         UV_FS_UNLINK, req_wrap_async, "path", TRACE_STR_COPY(*path))
     AsyncCall(env, req_wrap_async, args, "mkdir", UTF8,
-              mkdirp ? AfterMkdirp : AfterNoArgs,
-              mkdirp ? MKDirpAsync : uv_fs_mkdir, *path, mode);
+              AfterMkdir,
+              mkdirp ? MKDirpAsync : MKDirAsync, *path, mode);
   } else {  // mkdir(path, mode, undefined, ctx)
     CHECK_EQ(argc, 5);
     FSReqWrapSync req_wrap_sync;
